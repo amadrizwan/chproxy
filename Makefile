@@ -39,8 +39,6 @@ clean:
 release-build:
 	@echo "Ver: $(BUILD_TAG), OPTS: $(BUILD_OPTS)"
 	GOOS=linux GOARCH=amd64 go build $(BUILD_OPTS)
-	rm chproxy-linux-amd64-*.tar.gz
-	tar czf chproxy-linux-amd64-$(BUILD_TAG).tar.gz chproxy
 
 release: format lint test clean release-build
 	@echo "Ver: $(BUILD_TAG), OPTS: $(BUILD_OPTS)"
