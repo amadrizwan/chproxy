@@ -3,14 +3,17 @@ package cache
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
-	"github.com/Vertamedia/chproxy/config"
-	"github.com/Vertamedia/chproxy/log"
-	"github.com/go-redis/redis/v8"
+	"errors"
 	"io"
 	"regexp"
 	"strconv"
 	"time"
+
+	"github.com/contentsquare/chproxy/config"
+	"github.com/contentsquare/chproxy/log"
+	"github.com/go-redis/redis/v8"
 )
 
 type redisCache struct {
@@ -94,7 +97,7 @@ func (r *redisCache) Get(key *Key) (*CachedData, error) {
 	val, err := r.client.Get(ctx, key.String()).Result()
 
 	// if key not found in cache
-	if err == redis.Nil || val == pendingTransactionVal {
+	if errors.Is(err, redis.Nil) {
 		return nil, ErrMissing
 	}
 
@@ -118,13 +121,18 @@ func (r *redisCache) Get(key *Key) (*CachedData, error) {
 		log.Errorf("Not able to fetch TTL for: %s ", key)
 	}
 
+	decoded, err := base64.StdEncoding.DecodeString(payload.Payload)
+	if err != nil {
+		log.Errorf("failed to decode payload: %s , due to: %v ", payload.Payload, err)
+		return nil, ErrMissing
+	}
 	value := &CachedData{
 		ContentMetadata: ContentMetadata{
 			Length:   payload.Length,
 			Type:     payload.Type,
 			Encoding: payload.Encoding,
 		},
-		Data: bytes.NewReader([]byte(payload.Payload)),
+		Data: bytes.NewReader(decoded),
 		Ttl:  ttl,
 	}
 
@@ -137,8 +145,9 @@ func (r *redisCache) Put(reader io.Reader, contentMetadata ContentMetadata, key 
 		return 0, err
 	}
 
+	encoded := base64.StdEncoding.EncodeToString(data)
 	payload := &redisCachePayload{
-		Length: contentMetadata.Length, Type: contentMetadata.Type, Encoding: contentMetadata.Encoding, Payload: string(data),
+		Length: contentMetadata.Length, Type: contentMetadata.Type, Encoding: contentMetadata.Encoding, Payload: encoded,
 	}
 
 	marshalled, err := json.Marshal(payload)

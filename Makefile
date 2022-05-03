@@ -30,6 +30,15 @@ lint:
 	go vet $(pkgs)
 	go list ./... | grep -v /vendor/ | xargs -n1 golint
 
+tidy:
+	go mod tidy
+
+deps:
+	go mod download
+
+go-lint: deps tidy
+	golangci-lint run -v
+
 reconfigure:
 	kill -HUP `pidof chproxy`
 
@@ -49,4 +58,4 @@ release: format lint test clean release-build
 release-build-docker:
 	@echo "Ver: $(BUILD_TAG)"
 	@DOCKER_BUILDKIT=1 docker build --target build --build-arg EXT_BUILD_TAG=$(BUILD_TAG) --progress plain -t chproxy-build .
-	@docker run --rm --entrypoint "/bin/sh" -v $(CURDIR):/host chproxy-build -c "/bin/cp /go/src/github.com/Vertamedia/chproxy/*.tar.gz /host"
+	@docker run --rm --entrypoint "/bin/sh" -v $(CURDIR):/host chproxy-build -c "/bin/cp /go/src/github.com/contentsquare/chproxy/*.tar.gz /host"

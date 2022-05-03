@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Vertamedia/chproxy/cache"
-	"github.com/Vertamedia/chproxy/config"
-	"github.com/Vertamedia/chproxy/log"
+	"github.com/contentsquare/chproxy/cache"
+	"github.com/contentsquare/chproxy/config"
+	"github.com/contentsquare/chproxy/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -56,7 +57,7 @@ func (rp *reverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	s, status, err := rp.getScope(req)
 	if err != nil {
 		q := getQuerySnippet(req)
-		err = fmt.Errorf("%q: %s; query: %q", req.RemoteAddr, err, q)
+		err = fmt.Errorf("%q: %w; query: %q", req.RemoteAddr, err, q)
 		respondWith(rw, err, status)
 		return
 	}
@@ -66,7 +67,7 @@ func (rp *reverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if err := s.incQueued(); err != nil {
 		limitExcess.With(s.labels).Inc()
 		q := getQuerySnippet(req)
-		err = fmt.Errorf("%s: %s; query: %q", s, err, q)
+		err = fmt.Errorf("%s: %w; query: %q", s, err, q)
 		respondWith(rw, err, http.StatusTooManyRequests)
 		return
 	}
@@ -177,13 +178,12 @@ func (rp *reverseProxy) proxyRequest(s *scope, rw http.ResponseWriter, srw *stat
 	rp.rp.ServeHTTP(rw, req)
 
 	err := ctx.Err()
-	switch err {
-	case nil:
+	if err == nil { //nolint: gocritic
 		// The request has been successfully proxied.
 		since := float64(time.Since(startTime).Seconds())
 		proxiedResponseDuration.With(s.labels).Observe(since)
 
-		// cache.FSResponseWriter pushes status code to srw on Finalize/Unregister actions
+		// cache.FSResponseWriter pushes status code to srw on Finalize/Fail actions
 		// but they didn't happen yet, so manually propagate the status code from crw to srw.
 		if crw, ok := rw.(*cache.BufferedResponseWriter); ok {
 			srw.statusCode = crw.StatusCode()
@@ -197,8 +197,7 @@ func (rp *reverseProxy) proxyRequest(s *scope, rw http.ResponseWriter, srw *stat
 			err := fmt.Errorf("%s: cannot reach %s; query: %q", s, s.host.addr.Host, q)
 			respondWith(srw, err, srw.statusCode)
 		}
-
-	case context.Canceled:
+	} else if errors.Is(err, context.Canceled) {
 		canceledRequest.With(s.labels).Inc()
 
 		q := getQuerySnippet(req)
@@ -207,8 +206,7 @@ func (rp *reverseProxy) proxyRequest(s *scope, rw http.ResponseWriter, srw *stat
 			log.Errorf("%s: cannot kill query: %s; query: %q", s, err, q)
 		}
 		srw.statusCode = 499 // See https://httpstatuses.com/499 .
-
-	case context.DeadlineExceeded:
+	} else if errors.Is(err, context.DeadlineExceeded) {
 		timeoutRequest.With(s.labels).Inc()
 
 		// Penalize host with the timed out query, because it may be overloaded.
@@ -219,11 +217,10 @@ func (rp *reverseProxy) proxyRequest(s *scope, rw http.ResponseWriter, srw *stat
 		if err := s.killQuery(); err != nil {
 			log.Errorf("%s: cannot kill query: %s; query: %q", s, err, q)
 		}
-		err = fmt.Errorf("%s: %s; query: %q", s, timeoutErrMsg, q)
+		err = fmt.Errorf("%s: %w; query: %q", s, timeoutErrMsg, q)
 		respondWith(rw, err, http.StatusGatewayTimeout)
 		srw.statusCode = http.StatusGatewayTimeout
-
-	default:
+	} else {
 		panic(fmt.Sprintf("BUG: context.Context.Err() returned unexpected error: %s", err))
 	}
 }
@@ -238,7 +235,7 @@ func (rp *reverseProxy) serveFromCache(s *scope, srw *statResponseWriter, req *h
 
 	q, err := getFullQuery(req)
 	if err != nil {
-		err = fmt.Errorf("%s: cannot read query: %s", s, err)
+		err = fmt.Errorf("%s: cannot read query: %w", s, err)
 		respondWith(srw, err, http.StatusBadRequest)
 		return
 	}
@@ -278,18 +275,27 @@ func (rp *reverseProxy) serveFromCache(s *scope, srw *statResponseWriter, req *h
 	}
 
 	// Await for potential result from concurrent query
-	if userCache.AwaitForConcurrentTransaction(key) {
-		cachedData, err := userCache.Get(key)
-		if err == nil {
-			_ = RespondWithData(srw, cachedData.Data, cachedData.ContentMetadata, cachedData.Ttl, http.StatusOK)
-			cacheHitFromConcurrentQueries.With(labels).Inc()
-			log.Debugf("%s: cache hit after awaiting concurrent query", s)
+	transactionState, err := userCache.AwaitForConcurrentTransaction(key)
+	if err != nil {
+		// log and continue processing
+		log.Errorf("failed to await for concurrent transaction due to: %v", err)
+	} else {
+		if transactionState.IsCompleted() {
+			cachedData, err := userCache.Get(key)
+			if err == nil {
+				_ = RespondWithData(srw, cachedData.Data, cachedData.ContentMetadata, cachedData.Ttl, http.StatusOK)
+				cacheHitFromConcurrentQueries.With(labels).Inc()
+				log.Debugf("%s: cache hit after awaiting concurrent query", s)
+				return
+			} else {
+				cacheMissFromConcurrentQueries.With(labels).Inc()
+				log.Debugf("%s: cache miss after awaiting concurrent query", s)
+			}
+		} else if transactionState.IsFailed() {
+			err = fmt.Errorf("%s: concurrent query failed", s)
+			respondWith(srw, err, http.StatusInternalServerError)
 			return
-		} else {
-			cacheMissFromConcurrentQueries.With(labels).Inc()
-			log.Debugf("%s: cache miss after awaiting concurrent query", s)
 		}
-
 	}
 
 	// The response wasn't found in the cache.
@@ -297,16 +303,10 @@ func (rp *reverseProxy) serveFromCache(s *scope, srw *statResponseWriter, req *h
 	bufferedRespWriter := cache.NewBufferedResponseWriter(srw)
 
 	// Initialise transaction
-	err = userCache.Register(key)
+	err = userCache.Create(key)
 	if err != nil {
 		log.Errorf("%s: %s; query: %q - failed to register transaction", s, err, q)
 	}
-	defer func() {
-		// Eventually unregister ongoing transaction
-		if err = userCache.Unregister(key); err != nil {
-			log.Errorf("%s: %s; query: %q", s, err, q)
-		}
-	}()
 
 	// proxy request and capture response along with headers to [[BufferedResponseWriter]]
 	rp.proxyRequest(s, bufferedRespWriter, srw, req)
@@ -315,6 +315,13 @@ func (rp *reverseProxy) serveFromCache(s *scope, srw *statResponseWriter, req *h
 		// Restore the original status code by proxyRequest if it was set.
 		if srw.statusCode != 0 {
 			bufferedRespWriter.WriteHeader(srw.statusCode)
+		}
+
+		// mark transaction as failed
+		// todo: discuss if we should mark it as failed upon timeout. The rational against it would be to hope that
+		// 		 partial results of the query are cached and therefore subsequent execution can succeed
+		if err = userCache.Fail(key); err != nil {
+			log.Errorf("%s: %s; query: %q", s, err, q)
 		}
 		err = RespondWithoutData(srw)
 		if err != nil {
@@ -336,14 +343,19 @@ func (rp *reverseProxy) serveFromCache(s *scope, srw *statResponseWriter, req *h
 		if err != nil {
 			log.Errorf("%s: %s; query: %q - failed to put response in the cache", s, err, q)
 		}
+
+		// mark transaction as completed
+		if err = userCache.Complete(key); err != nil {
+			log.Errorf("%s: %s; query: %q", s, err, q)
+		}
+
 		err = RespondWithData(srw, &buf, contentMetadata, expiration, bufferedRespWriter.StatusCode())
 		if err != nil {
-			err = fmt.Errorf("%s: %s; query: %q", s, err, q)
+			err = fmt.Errorf("%s: %w; query: %q", s, err, q)
 			respondWith(srw, err, http.StatusInternalServerError)
 			return
 		}
 	}
-
 }
 
 // applyConfig applies the given cfg to reverseProxy.
@@ -377,7 +389,15 @@ func (rp *reverseProxy) applyConfig(cfg *config.Config) error {
 		if _, ok := caches[cc.Name]; ok {
 			return fmt.Errorf("duplicate config for cache %q", cc.Name)
 		}
-		tmpCache, err := cache.NewAsyncCache(cc)
+		var maxExecutionTime config.Duration
+		for _, user := range cfg.Users {
+			if user.Name == cc.Name {
+				maxExecutionTime = user.MaxExecutionTime
+				break
+			}
+		}
+
+		tmpCache, err := cache.NewAsyncCache(cc, time.Duration(maxExecutionTime))
 		if err != nil {
 			return err
 		}
@@ -391,7 +411,7 @@ func (rp *reverseProxy) applyConfig(cfg *config.Config) error {
 		}
 		params[p.Name], err = newParamsRegistry(p.Params)
 		if err != nil {
-			return fmt.Errorf("cannot initialize params %q: %s", p.Name, err)
+			return fmt.Errorf("cannot initialize params %q: %w", p.Name, err)
 		}
 	}
 

@@ -30,6 +30,8 @@ var (
 		Request:  "/?query=SELECT%201",
 		Response: "1\n",
 	}
+
+	defaultExecutionTime = Duration(30 * time.Second)
 )
 
 // Config describes server configuration, access and proxy rules
@@ -326,7 +328,7 @@ type Cluster struct {
 	// By default timed out queries are killed under `default` user.
 	KillQueryUser KillQueryUser `yaml:"kill_query_user,omitempty"`
 
-	// DEPRECATED: HeartBeatInterval is an interval of checking
+	// Deprecated: HeartBeatInterval is an interval of checking
 	// all cluster nodes for availability
 	// if omitted or zero - interval will be set to 5s
 	HeartBeatInterval Duration `yaml:"heartbeat_interval,omitempty"`
@@ -596,7 +598,9 @@ type Cache struct {
 	// on new request and re-cached
 	Expire Duration `yaml:"expire,omitempty"`
 
-	// Grace duration before the expired entry is deleted from the cache.
+	// Deprecated: GraceTime duration before the expired entry is deleted from the cache.
+	// It's deprecated and in future versions it'll be replaced by user's MaxExecutionTime.
+	// It's already the case today if value of GraceTime is omitted.
 	GraceTime Duration `yaml:"grace_time,omitempty"`
 
 	FileSystem FileSystemCacheConfig `yaml:"file_system,omitempty"`
@@ -661,7 +665,7 @@ func (c *Cache) checkFileSystemConfig() error {
 }
 
 func (c *Cache) checkRedisConfig() error {
-	if len(c.Redis.Addresses) <= 0 {
+	if len(c.Redis.Addresses) == 0 {
 		return fmt.Errorf("`cache.redis.addresses` must be specified for %q", c.Name)
 	}
 	return nil
@@ -803,6 +807,10 @@ func LoadFile(filename string) (*Config, error) {
 	}
 	for i := range cfg.Users {
 		u := &cfg.Users[i]
+		if u.MaxExecutionTime == 0 {
+			u.MaxExecutionTime = defaultExecutionTime
+		}
+
 		ud := time.Duration(u.MaxExecutionTime + u.MaxQueueTime)
 		if ud > maxResponseTime {
 			maxResponseTime = ud
@@ -827,7 +835,7 @@ func LoadFile(filename string) (*Config, error) {
 	}
 
 	if err := cfg.checkVulnerabilities(); err != nil {
-		return nil, fmt.Errorf("security breach: %s\nSet option `hack_me_please=true` to disable security errors", err)
+		return nil, fmt.Errorf("security breach: %w\nSet option `hack_me_please=true` to disable security errors", err)
 	}
 	return cfg, nil
 }

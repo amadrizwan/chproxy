@@ -5,8 +5,9 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"github.com/Vertamedia/chproxy/cache"
 	"io"
 	"io/ioutil"
 	"net"
@@ -14,14 +15,18 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/Vertamedia/chproxy/config"
-	"github.com/Vertamedia/chproxy/log"
+	"github.com/contentsquare/chproxy/cache"
+
 	"github.com/alicebob/miniredis/v2"
+	"github.com/contentsquare/chproxy/config"
+	"github.com/contentsquare/chproxy/log"
 )
 
 var testDir = "./temp-test-data"
@@ -88,7 +93,7 @@ func TestServe(t *testing.T) {
 				if resp.StatusCode != http.StatusOK {
 					t.Fatalf("unexpected status code: %d; expected: %d", resp.StatusCode, http.StatusOK)
 				}
-				checkHttpResponse(t, resp, expectedOkResp)
+				checkResponse(t, resp.Body, expectedOkResp)
 
 				// check cached response
 				key := &cache.Key{
@@ -348,11 +353,11 @@ func TestServe(t *testing.T) {
 				checkErr(t, err)
 
 				resp := httpRequest(t, req, http.StatusOK)
-				checkHttpResponse(t, resp, expectedOkResp)
+				checkResponse(t, resp.Body, expectedOkResp)
 				resp2 := httpRequest(t, req, http.StatusOK)
-				checkHttpResponse(t, resp2, expectedOkResp)
+				checkResponse(t, resp2.Body, expectedOkResp)
 				keys := redisClient.Keys()
-				if len(keys) != 1 {
+				if len(keys) != 2 { // 2 because there is a record stored for transaction and a cache item
 					t.Fatalf("unexpected amount of keys in redis: %v", len(keys))
 				}
 
@@ -365,7 +370,7 @@ func TestServe(t *testing.T) {
 				str, err := redisClient.Get(key.String())
 				checkErr(t, err)
 
-				if !strings.Contains(str, "Ok") || !strings.Contains(str, "text/plain") || !strings.Contains(str, "charset=utf-8") {
+				if !strings.Contains(str, base64.StdEncoding.EncodeToString([]byte("Ok."))) || !strings.Contains(str, "text/plain") || !strings.Contains(str, "charset=utf-8") {
 					t.Fatalf("result from cache query is wrong: %s", str)
 				}
 
@@ -376,6 +381,57 @@ func TestServe(t *testing.T) {
 			},
 			startHTTP,
 		},
+		{
+			"http requests with caching in redis (testcase for base64 encoding/decoding)",
+			"testdata/http.cache.redis.yml",
+			func(t *testing.T) {
+				redisClient.FlushAll()
+				q := "SELECT 1 FORMAT TabSeparatedWithNamesAndTypes"
+				req, err := http.NewRequest("GET", "http://127.0.0.1:9090?query="+url.QueryEscape(q), nil)
+				checkErr(t, err)
+
+				resp := httpRequest(t, req, http.StatusOK)
+				checkResponse(t, resp.Body, string(bytesWithInvalidUTFPairs))
+				resp2 := httpRequest(t, req, http.StatusOK)
+				// if we do not use base64 to encode/decode the cached payload, EOF error will be thrown here.
+				checkResponse(t, resp2.Body, string(bytesWithInvalidUTFPairs))
+				keys := redisClient.Keys()
+				if len(keys) != 2 { // 2 because there is a record stored for transaction, and a cache item
+					t.Fatalf("unexpected amount of keys in redis: %v", len(keys))
+				}
+
+				// check cached response
+				key := &cache.Key{
+					Query:          []byte(q),
+					AcceptEncoding: "gzip",
+					Version:        cache.Version,
+				}
+				str, err := redisClient.Get(key.String())
+				checkErr(t, err)
+
+				type redisCachePayload struct {
+					Length   int64  `json:"l"`
+					Type     string `json:"t"`
+					Encoding string `json:"enc"`
+					Payload  string `json:"payload"`
+				}
+
+				var unMarshaledPayload redisCachePayload
+				err = json.Unmarshal([]byte(str), &unMarshaledPayload)
+				checkErr(t, err)
+				if unMarshaledPayload.Payload != base64.StdEncoding.EncodeToString(bytesWithInvalidUTFPairs) {
+					t.Fatalf("result from cache query is wrong: %s", str)
+				}
+				decoded, err := base64.StdEncoding.DecodeString(unMarshaledPayload.Payload)
+				checkErr(t, err)
+
+				if unMarshaledPayload.Length != int64(len(decoded)) {
+					t.Fatalf("the declared length %d and actual length %d is not same", unMarshaledPayload.Length, len(decoded))
+				}
+			},
+			startHTTP,
+		},
+
 		{
 			"http gzipped POST request",
 			"testdata/http.cache.yml",
@@ -529,9 +585,14 @@ func TestServe(t *testing.T) {
 				req = req.WithContext(ctx)
 				_, err = http.DefaultClient.Do(req)
 				expErr := "context deadline exceeded"
+				if err == nil {
+					t.Fatal("expected deadline error")
+				}
+
 				if !strings.Contains(err.Error(), "context deadline exceeded") {
 					t.Fatalf("unexpected error: %s; expected: %s", err, expErr)
 				}
+				// verifies if query isn't cached and if kill query was launched.
 				select {
 				case <-fakeCHState.syncCH:
 					// wait while chproxy will detect that request was canceled and will drop temp file
@@ -540,6 +601,31 @@ func TestServe(t *testing.T) {
 				case <-time.After(time.Second * 5):
 					t.Fatalf("expected deadline query to be killed")
 				}
+			},
+			startHTTP,
+		},
+		{
+			"http concurrent transaction from cache",
+			"testdata/http.concurrent.transaction.yml",
+			func(t *testing.T) {
+
+				// max_exec_time = 300 ms, grace_time = 160 ms (> max_exec_time/2)
+				// scenario: 1st query completes before grace_time elapsed. 2nd query is served from cache.
+
+				q := "SELECT SLEEP100"
+				executeTwoConcurrentRequests(t, q, http.StatusOK, http.StatusOK, "success mate", "success mate")
+			},
+			startHTTP,
+		},
+		{
+			"http concurrent transaction failure scenario",
+			"testdata/http.concurrent.transaction.yml",
+			func(t *testing.T) {
+				// max_exec_time = 300 ms, grace_time = 160 ms (> max_exec_time/2)
+				// scenario: 1st query fails before grace_time elapsed. 2nd query fails as well.
+
+				q := "SELECT ERROR"
+				executeTwoConcurrentRequests(t, q, http.StatusTeapot, http.StatusInternalServerError, "", "concurrent query failed")
 			},
 			startHTTP,
 		},
@@ -591,20 +677,6 @@ func TestServe(t *testing.T) {
 
 			tc.testFn(t)
 		})
-	}
-}
-
-func checkHttpResponse(t *testing.T, resp *http.Response, expectedResp string) {
-	buf := new(bytes.Buffer)
-	_, err := buf.ReadFrom(resp.Body)
-	if err != nil {
-		t.Fatalf("unexpected error while reading a response body: %v", err)
-	}
-	responseBodyStr := buf.String()
-	resp.Body.Close()
-
-	if responseBodyStr != expectedResp {
-		t.Fatalf("got: %q; expected: %q", responseBodyStr, expectedResp)
 	}
 }
 
@@ -680,6 +752,8 @@ func startCHServer() {
 	http.ListenAndServe(":8124", http.HandlerFunc(fakeCHHandler))
 }
 
+var patt = regexp.MustCompile(`(\d+)$`)
+
 func fakeCHHandler(w http.ResponseWriter, r *http.Request) {
 	query, err := getFullQuery(r)
 	if err != nil {
@@ -692,20 +766,42 @@ func fakeCHHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "got empty query for non-GET request")
 		return
 	}
-	switch string(query) {
-	case "SELECT ERROR":
-		w.WriteHeader(http.StatusTeapot)
-		fmt.Fprint(w, "DB::Exception\n")
-	case "SELECT SLEEP":
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "foo")
+	defer func() {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-
+	}()
+	q := string(query)
+	switch {
+	case q == "SELECT ERROR":
+		w.WriteHeader(http.StatusTeapot)
+		fmt.Fprint(w, "DB::Exception\n")
+	case q == "SELECT SLEEP":
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "foo")
 		fakeCHState.sleep()
-
 		fmt.Fprint(w, "bar")
+
+	case strings.Contains(q, "SELECT SLEEP"):
+		numberStrings := patt.FindAllStringSubmatch(q, -1)
+		if len(numberStrings) == 0 {
+			panic("couldn't extract number from sleep call to clickhouse mock")
+		}
+		nr, err := strconv.Atoi(numberStrings[0][1])
+		if err != nil {
+			panic(err)
+		}
+
+		duration, err := time.ParseDuration(fmt.Sprintf("%vms", nr))
+		if err != nil {
+			panic(err)
+		}
+		time.Sleep(duration)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "success mate") //nolint
+	case q == "SELECT 1 FORMAT TabSeparatedWithNamesAndTypes":
+		w.WriteHeader(http.StatusOK)
+		w.Write(bytesWithInvalidUTFPairs)
 	default:
 		if strings.Contains(string(query), killQueryPattern) {
 			fakeCHState.kill()
@@ -715,6 +811,42 @@ func fakeCHHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// executeTwoConcurrentRequests concurrently executes 2 requests for the same query.
+// Results are asserted according to the specified input parameters.
+func executeTwoConcurrentRequests(t *testing.T, query string, firstStatusCode, secondStatusCode int, firstBody, secondBody string) {
+	u := fmt.Sprintf("http://127.0.0.1:9090?query=%s&user=concurrent_user", url.QueryEscape(query))
+	req, err := http.NewRequest("GET", u, nil)
+	checkErr(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var resp1 string
+	var resp2 string
+	go func() {
+		resp := httpRequest(t, req, firstStatusCode)
+		resp1 = bbToString(t, resp.Body)
+		wg.Done()
+	}()
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		resp := httpRequest(t, req, secondStatusCode)
+		resp2 = bbToString(t, resp.Body)
+		wg.Done()
+	}()
+	wg.Wait()
+
+	if !strings.Contains(resp1, firstBody) {
+		t.Fatalf("concurrent test scenario: unexpected resp body: %s, expected : %s", resp1, firstBody)
+	}
+
+	if !strings.Contains(resp2, secondBody) {
+		t.Fatalf("concurrent test scenario: unexpected resp body: %s, expected : %s", resp2, secondBody)
+	}
+}
+
+var bytesWithInvalidUTFPairs = []byte{239, 191, 189, 1, 32, 50, 239, 191}
+
 var fakeCHState = &stateCH{
 	syncCH: make(chan struct{}),
 }
@@ -723,12 +855,6 @@ type stateCH struct {
 	sync.Mutex
 	inited bool
 	syncCH chan struct{}
-}
-
-func (s *stateCH) isInited() bool {
-	s.Lock()
-	defer s.Unlock()
-	return s.inited
 }
 
 func (s *stateCH) kill() {
@@ -820,6 +946,7 @@ func httpGet(t *testing.T, url string, statusCode int) *http.Response {
 }
 
 func httpRequest(t *testing.T, request *http.Request, statusCode int) *http.Response {
+	t.Helper()
 	client := http.Client{}
 	resp, err := client.Do(request)
 	if err != nil {

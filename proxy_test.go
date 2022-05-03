@@ -18,11 +18,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 
-	"github.com/Vertamedia/chproxy/config"
+	"github.com/contentsquare/chproxy/config"
 )
 
 const (
-	okResponse = "1\n"
+	okResponse = "1"
 )
 
 var goodCfg = &config.Config{
